@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.sw[nop]
+.vscode/
+deploy/dist/

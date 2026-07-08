@@ -1,0 +1,28 @@
+FROM yahboomtechnology/ros-humble:4.1.2
+
+# ---- Coral Edge TPU 依赖（arm64 / cp310，全部本地文件，构建期不联网）----
+COPY libusb-1.0-0_arm64.deb                                /tmp/libusb.deb
+COPY libedgetpu1-std_16.0tf2.16.1-1.ubuntu22.04_arm64.deb  /tmp/edgetpu.deb
+COPY tflite_runtime-2.16.2-cp310-cp310-linux_aarch64.whl   /tmp/tflite_runtime-2.16.2-cp310-cp310-linux_aarch64.whl
+RUN dpkg -i /tmp/libusb.deb /tmp/edgetpu.deb && \
+    pip3 install --no-index --no-deps --no-cache-dir /tmp/tflite_runtime-2.16.2-cp310-cp310-linux_aarch64.whl && \
+    rm -f /tmp/libusb.deb /tmp/edgetpu.deb /tmp/tflite_runtime-2.16.2-cp310-cp310-linux_aarch64.whl
+
+# ---- 新节点 + 模型，重建 astra 包 ----
+ARG PKG=/root/yahboomcar_ws/src/yahboomcar_astra
+COPY face_fllow_tpu.py ${PKG}/yahboomcar_astra/face_fllow_tpu.py
+COPY objTracker_tpu.py ${PKG}/yahboomcar_astra/objTracker_tpu.py
+COPY objControl.py     ${PKG}/yahboomcar_astra/objControl.py
+COPY person_goal_bridge.py ${PKG}/yahboomcar_astra/person_goal_bridge.py
+COPY follow_collision.launch.py ${PKG}/launch/follow_collision.launch.py
+COPY follow_nav2.launch.py      ${PKG}/launch/follow_nav2.launch.py
+COPY nav2_follow.yaml           ${PKG}/config/nav2_follow.yaml
+COPY nav2_follow_dwb.yaml       ${PKG}/config/nav2_follow_dwb.yaml
+COPY setup.py          ${PKG}/setup.py
+COPY models/ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite \
+     ${PKG}/yahboomcar_astra/models/ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite
+COPY models/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite \
+     ${PKG}/yahboomcar_astra/models/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite
+COPY models/coco_labels.txt ${PKG}/yahboomcar_astra/models/coco_labels.txt
+RUN /bin/bash -c "source /opt/ros/humble/setup.bash && cd /root/yahboomcar_ws && \
+    colcon build --packages-select yahboomcar_astra"
