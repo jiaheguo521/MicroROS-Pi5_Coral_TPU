@@ -12,6 +12,7 @@ RUN dpkg -i /tmp/libusb.deb /tmp/edgetpu.deb && \
 ARG PKG=/root/yahboomcar_ws/src/yahboomcar_astra
 COPY face_fllow_tpu.py ${PKG}/yahboomcar_astra/face_fllow_tpu.py
 COPY objTracker_tpu.py ${PKG}/yahboomcar_astra/objTracker_tpu.py
+COPY objTracker_reid_tpu.py ${PKG}/yahboomcar_astra/objTracker_reid_tpu.py
 COPY objControl.py     ${PKG}/yahboomcar_astra/objControl.py
 COPY person_goal_bridge.py ${PKG}/yahboomcar_astra/person_goal_bridge.py
 COPY follow_collision.launch.py ${PKG}/launch/follow_collision.launch.py
@@ -24,5 +25,11 @@ COPY models/ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite \
 COPY models/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite \
      ${PKG}/yahboomcar_astra/models/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite
 COPY models/coco_labels.txt ${PKG}/yahboomcar_astra/models/coco_labels.txt
+# Re-ID：检测器+嵌入器 co-compile 产物（独立子目录+改名，不与上面的单独检测器模型混用/共享缓存）
+# reid/ = 旧嵌入器(MobileNetV1，小/快/区分度弱，备选) reid_youtu/ = 新嵌入器(Youtu ReID ResNet50，默认)
+COPY models/reid/det_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid/det_reid_edgetpu.tflite
+COPY models/reid/emb_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid/emb_reid_edgetpu.tflite
+COPY models/reid_youtu/det_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_youtu/det_reid_edgetpu.tflite
+COPY models/reid_youtu/emb_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_youtu/emb_reid_edgetpu.tflite
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && cd /root/yahboomcar_ws && \
     colcon build --packages-select yahboomcar_astra"

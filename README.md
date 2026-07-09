@@ -90,6 +90,10 @@ ros2 run yahboomcar_astra objTracker_tpu
 # Nav2 follow: camera-bearing + LiDAR-range → odom person estimate → Nav2 real obstacle-avoidance detour
 # ONE command brings up everything (bringup + Nav2 + person-goal bridge + detector); gimbal keeps you centred, searches when lost
 ros2 launch yahboomcar_astra follow_nav2.launch.py                 # default controller:=dwb; controller:=rpp to A/B
+
+# Nav2 follow + Re-ID identity lock (second TPU net: reject false boxes / multi-person / re-acquire after occlusion)
+# enable_gimbal_pan:=false: before lock, the gimbal sweeps to search, which fights the "stand still 3s to lock" gesture
+ros2 launch yahboomcar_astra follow_nav2.launch.py detector:=objTracker_reid_tpu enable_gimbal_pan:=false
 ```
 
 Detector params: `target_label` (default `person`), `conf_threshold` (default `0.5`), `min_hits` (debounce, default `3`). Controller `objControl` follow/search params (`target_dist`, `front_angle`, `angular_kp`, …) are tunable at runtime — see the node's `declare_param`.
@@ -101,6 +105,7 @@ Point the autostart `ros2_humble.sh` at `:4.1.2-tpu` and add `-v /dev/bus/usb:/d
 - **Face following** — [face_fllow_tpu.py](root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/face_fllow_tpu.py): Haar cascade → Edge TPU SSD MobileNet v2 face detector (≈23 ms/inference, measured), box center fed to the original PID/servo loop.
 - **Person / object following** — detector [objTracker_tpu.py](root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/objTracker_tpu.py): Edge TPU SSD MobileNet v2 **COCO** detector, class-filtered (`target_label`, default `person`) + N-frame debounce, publishing the same `/Current_point` so the stock `colorTracker.py` (gimbal-only) works unchanged. Controller [objControl.py](root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/objControl.py) adds **LiDAR-ranged base following** (turn from the gimbal angle; drive forward/back to hold a set distance from `/scan`) with a lost-target gimbal search. Obstacle safety via **`nav2_collision_monitor`** ([follow_collision.launch.py](root/yahboomcar_ws/src/yahboomcar_astra/launch/follow_collision.launch.py), footprint-aware stop/slow zones).
 - **Nav2 follow** — [person_goal_bridge.py](root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/person_goal_bridge.py): fuses camera bearing + LiDAR range into a **person estimate in the odom frame** (EMA + occlusion gating so a chair between you and the robot doesn't stop it), feeds it as a moving goal to a map-less **Nav2** stack for **real obstacle-avoidance detour**. Decoupled gimbal points at the estimate (keeps you centred, searches when lost). One-command launch, `controller:=rpp|dwb`.
+- **Single-target lock / Re-ID (multi-person)** — detector [objTracker_reid_tpu.py](root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/objTracker_reid_tpu.py): a second TPU net (Tencent Youtu Lab person Re-ID, ResNet50 backbone, re-quantized and compiled by this project) scores each candidate's appearance to lock one person, reject false boxes, avoid switching between people, and re-acquire after occlusion; initial lock triggers by standing still and close for 3s, or instantly via the `/Reid_Lock` topic to switch target. Plugs in upstream at `/Current_point`; the bridge is unchanged.
 
 ## Restore to factory
 

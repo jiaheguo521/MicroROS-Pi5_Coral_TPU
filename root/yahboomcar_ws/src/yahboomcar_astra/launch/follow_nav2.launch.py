@@ -18,6 +18,8 @@
    ros2 launch yahboomcar_astra follow_nav2.launch.py hfov_deg:=62 bearing_sign:=-1 standoff:=1.2
 控制器 A/B 对比（换 nav2 参数文件，其余不变）：
    ros2 launch yahboomcar_astra follow_nav2.launch.py controller:=rpp   # 默认 dwb
+检测器 A/B 对比（换检测器可执行文件，其余不变；默认仍是旧检测器，不影响现状）：
+   ros2 launch yahboomcar_astra follow_nav2.launch.py detector:=objTracker_reid_tpu   # 默认 objTracker_tpu
 """
 import os
 from ament_index_python.packages import get_package_share_directory
@@ -64,7 +66,9 @@ def generate_launch_description():
         DeclareLaunchArgument("bringup", default_value="true",
                               description="是否一并起 yahboomcar_bringup(odom+TF)；已单独起就设 false"),
         DeclareLaunchArgument("run_detector", default_value="true",
-                              description="是否一并起 objTracker_tpu 检测器(发 /Current_point)"),
+                              description="是否一并起检测器(发 /Current_point)"),
+        DeclareLaunchArgument("detector", default_value="objTracker_tpu",
+                              description="objTracker_tpu(默认，不变)|objTracker_reid_tpu(Re-ID外观锁定，拒误检/多人不跳/遮挡重认)"),
         DeclareLaunchArgument("show_image", default_value="true",
                               description="检测器弹 OpenCV 画面窗口(看黄框)；嫌占 CPU 设 false"),
     ]
@@ -78,7 +82,8 @@ def generate_launch_description():
     )
 
     detector = Node(
-        package="yahboomcar_astra", executable="objTracker_tpu", name="objTracker_tpu",
+        package="yahboomcar_astra", executable=LaunchConfiguration("detector"),
+        name=LaunchConfiguration("detector"),
         output="screen",
         parameters=[{"show_image": ParameterValue(LaunchConfiguration("show_image"), value_type=bool)}],
         condition=IfCondition(LaunchConfiguration("run_detector")),

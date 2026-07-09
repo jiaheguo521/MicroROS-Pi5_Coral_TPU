@@ -22,6 +22,8 @@ LIBUSB_DEB="libusb-1.0-0_arm64.deb"
 MODEL="ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite"
 COCO_MODEL="ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite"
 COCO_LABELS="coco_labels.txt"
+REID_DET="det_reid_edgetpu.tflite"
+REID_EMB="emb_reid_edgetpu.tflite"
 
 TFLITE_WHL_URL="https://github.com/feranick/TFlite-builds/releases/download/v2.16.2/${TFLITE_WHL}"
 EDGETPU_DEB_URL="https://github.com/feranick/libedgetpu/releases/download/16.0TF2.16.1-1/${EDGETPU_DEB}"
@@ -57,7 +59,7 @@ dl() {  # dl <url> <dest>；已存在则跳过
 }
 
 if [ "$DO_PACK" = 1 ]; then
-  mkdir -p "$CACHE" "$BUNDLE/models"
+  mkdir -p "$CACHE" "$BUNDLE/models" "$BUNDLE/models/reid" "$BUNDLE/models/reid_youtu"
 
   echo "[1/3] 下载依赖(带缓存) → $CACHE"
   dl "$TFLITE_WHL_URL"  "$CACHE/$TFLITE_WHL"
@@ -72,6 +74,7 @@ if [ "$DO_PACK" = 1 ]; then
   cp "$ASTRA/setup.py"                           "$BUNDLE/setup.py"                # 入口(环境文件)
   cp "$ASTRA/yahboomcar_astra/face_fllow_tpu.py" "$BUNDLE/face_fllow_tpu.py"       # 节点真源
   cp "$ASTRA/yahboomcar_astra/objTracker_tpu.py" "$BUNDLE/objTracker_tpu.py"       # 目标跟随检测器真源
+  cp "$ASTRA/yahboomcar_astra/objTracker_reid_tpu.py" "$BUNDLE/objTracker_reid_tpu.py"  # Re-ID 锁定检测器真源
   cp "$ASTRA/yahboomcar_astra/objControl.py"     "$BUNDLE/objControl.py"           # 目标跟随控制器(云台+底盘)真源
   cp "$ASTRA/yahboomcar_astra/person_goal_bridge.py" "$BUNDLE/person_goal_bridge.py"  # 路B 跟人目标桥真源
   cp "$ASTRA/launch/follow_collision.launch.py"  "$BUNDLE/follow_collision.launch.py"  # 路C collision_monitor launch
@@ -93,6 +96,20 @@ if [ "$DO_PACK" = 1 ]; then
   else
     dl "$COCO_LABELS_URL" "$CACHE/$COCO_LABELS"; cp "$CACHE/$COCO_LABELS" "$BUNDLE/models/"
   fi
+  # Re-ID co-compile 产物：本地 edgetpu_compiler 编出来的，官方没有发布，没有 URL 可下；
+  # 只能仓库自带，缺失就报错提示先跑 benchmarks/smoke_obj_reid_tpu.py 头部说明的 co-compile 步骤
+  # reid/ = 旧嵌入器(MobileNetV1，备选) reid_youtu/ = 新嵌入器(Youtu ReID，默认)，两对不能混用
+  for reid_dir in reid reid_youtu; do
+    for f in "$REID_DET" "$REID_EMB"; do
+      if [ -f "$ASTRA/yahboomcar_astra/models/$reid_dir/$f" ]; then
+        cp "$ASTRA/yahboomcar_astra/models/$reid_dir/$f" "$BUNDLE/models/$reid_dir/"
+      else
+        echo "缺少 $reid_dir/$f，请先在开发机跑 edgetpu_compiler co-compile 生成（见 docs/pathB_follow_devlog.md Re-ID 章节），" \
+             "产物放到 $ASTRA/yahboomcar_astra/models/$reid_dir/ 后再重跑本脚本"
+        exit 1
+      fi
+    done
+  done
   echo "  构建包内容："; ls -la "$BUNDLE"
 fi
 

@@ -30,6 +30,7 @@ setup(
         'face_fllow = yahboomcar_astra.face_fllow:main',
         'face_fllow_tpu = yahboomcar_astra.face_fllow_tpu:main',
         'objTracker_tpu = yahboomcar_astra.objTracker_tpu:main',
+        'objTracker_reid_tpu = yahboomcar_astra.objTracker_reid_tpu:main',
         'objControl = yahboomcar_astra.objControl:main',
         'person_goal_bridge = yahboomcar_astra.person_goal_bridge:main',
         'follow_line = yahboomcar_astra.follow_line:main'

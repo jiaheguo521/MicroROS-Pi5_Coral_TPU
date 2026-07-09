@@ -90,6 +90,10 @@ ros2 run yahboomcar_astra objTracker_tpu
 # Nav2 跟随：相机方位 + 雷达距离 → odom 系人位姿估计 → 喂 Nav2 真绕行避障
 # 一条命令起全套（bringup + Nav2 + 跟人目标桥 + 检测器）；云台把你保持在画面中央、丢失时慢扫搜索
 ros2 launch yahboomcar_astra follow_nav2.launch.py                 # 默认 controller:=dwb；controller:=rpp 可 A/B 对比
+
+# Nav2 跟随 + Re-ID 身份锁定（第二个 TPU 网络，拒误检/多人不跳/遮挡重认）
+# enable_gimbal_pan:=false：锁定前云台会一直慢扫搜索，跟"站稳3秒才锁定"手势冲突，故关闭
+ros2 launch yahboomcar_astra follow_nav2.launch.py detector:=objTracker_reid_tpu enable_gimbal_pan:=false
 ```
 
 检测器参数：`target_label`（默认 `person`）、`conf_threshold`（默认 `0.5`）、`min_hits`（去抖，默认 `3`）。控制器 `objControl` 的跟随/搜索参数（`target_dist`、`front_angle`、`angular_kp` …）可运行时调，见节点 `declare_param`。
@@ -101,6 +105,7 @@ ros2 launch yahboomcar_astra follow_nav2.launch.py                 # 默认 cont
 - **人脸跟随** — [face_fllow_tpu.py](root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/face_fllow_tpu.py)：Haar 级联 → Edge TPU 上的 SSD MobileNet v2 人脸检测（实测单帧 invoke ≈23 ms），取框中心喂给原 PID/舵机回路。
 - **目标 / 人跟随** — 检测器 [objTracker_tpu.py](root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/objTracker_tpu.py)：Edge TPU SSD MobileNet v2 **COCO** 检测，按类别过滤（`target_label`，默认 `person`）+ 连续 N 帧去抖，发布同样的 `/Current_point`，故原厂 `colorTracker.py`（仅云台）可零改动复用。控制器 [objControl.py](root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/objControl.py) 增加**雷达定距底盘跟随**（转向追云台偏角；按 `/scan` 前后保持设定距离）+ 丢目标云台扫描。避障用 **`nav2_collision_monitor`**（[follow_collision.launch.py](root/yahboomcar_ws/src/yahboomcar_astra/launch/follow_collision.launch.py)，footprint 感知的停止/减速区）。
 - **Nav2 跟随** — [person_goal_bridge.py](root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/person_goal_bridge.py)：把相机方位 + 雷达距离融合成 **odom 系的人位姿估计**（EMA + 遮挡门控，人和车之间被椅子挡住也不停车），当移动目标喂给 map-less **Nav2** 做**真绕行避障**。云台解耦、指向估计（把你保持在画面中央、丢失时慢扫搜索）。一条命令起全套，`controller:=rpp|dwb`。
+- **多人单目标锁定 / Re-ID** — 检测器 [objTracker_reid_tpu.py](root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/objTracker_reid_tpu.py)：第二个 TPU 网络（Tencent Youtu Lab 行人 Re-ID，ResNet50 backbone，本项目自己重新量化+编译）逐候选算外观指纹，锁定一个人、拒误检、多人不跳、遮挡后重认；站稳 3 秒（够近+不动）触发初始锁定，或发 `/Reid_Lock` 话题立即换人。上游接在 `/Current_point`，桥节点零改动。
 
 ## 恢复到原厂
 
