@@ -14,7 +14,9 @@
       → NavigateToPose（移动超阈值重发抢占）→ Nav2 planner 真绕行。
 
 前提（阶段0探针已核实，见 memory pathb-nav2-probe）：先起 yahboomcar_bringup（提供
-/odom + odom→base_footprint→base_link 的 TF）。本节点不发 /cmd_vel——底盘全交给 Nav2。
+/odom + odom→base_footprint→base_link 的 TF）。位移全交给 Nav2；本节点只在**近距区**
+（人已在 standoff 内、Nav2 目标已取消）直接发 /cmd_vel 做**原地转向**把人转回正前方，
+此时 controller_server 不发速度，不存在两个发布者打架。
 Re-ID 后续作为上游节点接入（只改喂给 /Current_point 的 cx，本桥不动）——那是干净插槽。
 """
 import math
@@ -24,7 +26,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from std_msgs.msg import Int32
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import LaserScan
 from nav2_msgs.action import NavigateToPose
 from yahboomcar_msgs.msg import Position
@@ -89,6 +91,18 @@ class PersonGoalBridge(Node):
         # 距离读偏远→追幽灵前冲；此时框尺寸(px)才是可靠的"近"信号。框≥此值直接硬停，无视雷达距离。
         self.declare_parameter("close_stop_px", 320.0)    # 检测框最长边(EMA,px)≥此=人明显很近→硬停；0=禁用只靠雷达距离
         self.declare_parameter("size_smooth", 0.6)        # 框尺寸 EMA(0~1,越大越平滑)：SSD 尺寸噪声大，先平滑再判硬停
+        # 近距原地转向：进硬停区后**不位移**，但底盘原地转把人转回正前方。
+        # 否则人绕到侧后方时只有云台在追，很快撞 ±pan_limit 限位、然后彻底看不到人。
+        # 与云台读同一个 odom 估计、互不反馈（底盘转过去→人相对车方位→0→云台自然回中），
+        # 不会重演 §4.1 那种"两个环通过 cx 互相打架"的耦合振荡。
+        self.declare_parameter("enable_close_rotate", True)
+        self.declare_parameter("rotate_deadband_deg", 8.0)  # 人在正前方±此角内就不转(防原地抽搐)
+        self.declare_parameter("rotate_kp", 1.2)            # 方位误差(rad)→角速度(rad/s)
+        self.declare_parameter("rotate_max", 0.6)           # 角速度上限 (rad/s)
+        self.declare_parameter("rotate_min", 0.18)          # 角速度下限：太小电机转不动，原地干磨
+        # 丢目标后朝"最后看到的位置"继续转多久(s)。人绕到侧后方走出视野时，底盘再转过去常能重新看到。
+        # 转到正对该位置仍没看到就提前停（盲转无意义）。0=关闭，丢了就立刻停。
+        self.declare_parameter("lost_rotate_time", 2.5)
         self.declare_parameter("gimbal_tilt", -30)        # servo_s2 俯仰(负=低头)
         # 云台 v3：跟随时回正(0)由底盘转向对准；丢失才慢扫搜索。不积分 cx→不与底盘耦合。
         self.declare_parameter("enable_gimbal_pan", True)
@@ -134,6 +148,12 @@ class PersonGoalBridge(Node):
         self.resume_frames = g("resume_frames").value
         self.close_stop_px = g("close_stop_px").value
         self.size_smooth = g("size_smooth").value
+        self.enable_close_rotate = g("enable_close_rotate").value
+        self.rotate_deadband = math.radians(g("rotate_deadband_deg").value)
+        self.rotate_kp = g("rotate_kp").value
+        self.rotate_max = g("rotate_max").value
+        self.rotate_min = g("rotate_min").value
+        self.lost_rotate_time = g("lost_rotate_time").value
         self.gimbal_tilt = int(g("gimbal_tilt").value)
         self.enable_gimbal_pan = g("enable_gimbal_pan").value
         self.pan_limit = math.radians(g("pan_limit_deg").value)
@@ -162,6 +182,9 @@ class PersonGoalBridge(Node):
         self.pub_goal_dbg = self.create_publisher(PoseStamped, "/person_goal", 1)  # RViz/echo 调试
         self.pub_s1 = self.create_publisher(Int32, "servo_s1", 1)
         self.pub_s2 = self.create_publisher(Int32, "servo_s2", 1)
+        # 仅用于"近距原地转向"：此时 Nav2 目标已取消、controller_server 不再发速度，
+        # 由本节点独占 /cmd_vel；回到正常跟随前会清零交还给 Nav2。
+        self.pub_cmd = self.create_publisher(Twist, "/cmd_vel", 1)
         self.ac = ActionClient(self, NavigateToPose, "navigate_to_pose")
 
         # --- 状态 ---
@@ -184,6 +207,9 @@ class PersonGoalBridge(Node):
         self.search_dir = 1.0
         self.active_goal_handle = None
         self.stopped = False        # 是否已取消目标停车（避免重复取消）
+        self.rotating = False       # 是否正在发原地转向速度（底盘锁存最后速度，必须显式清零）
+        self.last_seen_odom = None  # 最后看到人的 odom 位置，供丢失后继续转向找人
+        self.last_seen_time = 0.0
         self.hold_stop = False      # 近距滞回硬停：为真时最高优先级不发目标
         self.far_count = 0          # 连续确认"人已退远"的帧数，达 resume_frames 才解除 hold_stop
 
@@ -351,6 +377,59 @@ class PersonGoalBridge(Node):
         self.last_goal_xy = None
         self.stopped = True
 
+    def _halt_rotation(self):
+        """清零原地转向速度。**底盘会锁存最后一条速度**，不显式发 0 车会一直转下去
+        （objControl.py 退出兜底同理）。交还 /cmd_vel 给 Nav2 前、丢目标时都必须调。"""
+        if self.rotating:
+            self.pub_cmd.publish(Twist())
+            self.rotating = False
+
+    def _rotate_to_bearing(self, b):
+        """把 base 系方位误差 b(rad, +左) 转成原地转向速度发出；已在死区内则明确停住。"""
+        if abs(b) <= self.rotate_deadband:
+            self._halt_rotation()
+            return
+        w = max(-self.rotate_max, min(self.rotate_max, self.rotate_kp * b))
+        if abs(w) < self.rotate_min:  # 太小电机转不动，只会原地干磨
+            w = math.copysign(self.rotate_min, w)
+        tw = Twist()
+        tw.angular.z = w              # +z=左转；人在左(bearing>0)就左转。转反了把 rotate_kp 取负
+        self.pub_cmd.publish(tw)      # linear.x 恒为 0——只转不走
+        self.rotating = True
+
+    def _rotate_toward_person(self):
+        """近距：不位移，只原地转底盘把人转回正前方。
+        人绕到侧后方时若只有云台追，很快撞 ±pan_limit 限位、之后彻底看不到人；底盘转过去后
+        人相对车的方位自然→0，云台随之回中，限位问题消失。方位取自与云台同一个 odom 估计，
+        两环互不反馈（不是拿 cx 互相喂），所以不会重演 §4.1 的耦合振荡。"""
+        if not self.enable_close_rotate:
+            self._halt_rotation()
+            return
+        b = self._person_bearing_base()
+        if b is None:                 # 估计还没建立：宁可不动
+            self._halt_rotation()
+            return
+        self._rotate_to_bearing(b)
+
+    def _rotate_toward_last_seen(self, now):
+        """丢目标后朝"最后看到的位置"再转一段：人绕到侧后方走出视野时，底盘继续转过去往往
+        就重新看到了（否则车停在原地、人再也进不了画面）。
+
+        用**最后看到的 odom 位置**而不是"当时的 base 方位角"——车一转，base 系的角度立刻过期；
+        odom 是世界系固定的，能随车转动持续换算出正确方位，转到正对它就自然收敛。
+        超过 lost_rotate_time 或已经转到正对它仍没看到，就停（再转下去只是盲转）。"""
+        if (not self.enable_close_rotate or self.lost_rotate_time <= 0
+                or self.last_seen_odom is None
+                or now - self.last_seen_time > self.lost_rotate_time):
+            self._halt_rotation()
+            return
+        pose = self._robot_pose()
+        if pose is None:
+            self._halt_rotation()
+            return
+        a = math.atan2(self.last_seen_odom[1] - pose[1], self.last_seen_odom[0] - pose[0])
+        self._rotate_to_bearing(math.atan2(math.sin(a - pose[2]), math.cos(a - pose[2])))
+
     def tick(self):
         now = time.time()
         if self.scan is None:
@@ -359,6 +438,9 @@ class PersonGoalBridge(Node):
         if (self.cx is None or now - self.last_pos_time > self.lost_timeout
                 or now - self.last_scan_time > self.lost_timeout):
             self._stop()
+            # 丢目标：朝最后看到的位置再转一段(常能把人重新转进视野)；超时/转到位就自动停。
+            # 注意底盘锁存最后速度，这个函数在任何不该转的情况下都会显式发 0。
+            self._rotate_toward_last_seen(now)
             self.est_odom = None
             self.size_ema = None    # 丢失清 EMA，重认时从头平滑
             return
@@ -367,14 +449,19 @@ class PersonGoalBridge(Node):
         if z is not None:
             self._update_estimate(z)
         if self.est_odom is None:
+            self._halt_rotation()
             return  # 尚未建立估计
 
         rob = self._robot_pose()
         if rob is None:
+            self._halt_rotation()
             return
         dx = self.est_odom[0] - rob[0]
         dy = self.est_odom[1] - rob[1]
         dist = math.hypot(dx, dy)
+        # 记住"最后看到人的 odom 位置"，供丢失后继续转向用（此刻 cx 是新鲜的、估计也有效）
+        self.last_seen_odom = self.est_odom
+        self.last_seen_time = now
 
         # 近距滞回硬停（最高优先级）。两个进停触发，任一满足就 hold_stop：
         #  ① 雷达距离近：dist < standoff×close_stop_frac；
@@ -399,10 +486,13 @@ class PersonGoalBridge(Node):
                 self.hold_stop = False
         else:
             self.far_count = 0
-        # hold_stop 或到 standoff 死区内：取消目标停车（别在人身边抽搐/原地拧）
+        # hold_stop 或到 standoff 死区内：取消 Nav2 目标（不位移），改为原地转向对准人
         if self.hold_stop or dist <= self.standoff + self.stop_deadband:
             self._stop()
+            self._rotate_toward_person()
             return
+        # 出了近距区，交还 /cmd_vel 给 Nav2 前必须先清零，否则残留转速会和 Nav2 打架
+        self._halt_rotation()
 
         # 目标 = 沿 robot→估计 方向后退 standoff，并对离车距离封顶（防超 costmap）
         ux, uy = dx / dist, dy / dist
@@ -447,6 +537,11 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # 退出兜底：底盘锁存最后速度，Ctrl-C 时若正在原地转向必须发 0，否则车会一直转
+        try:
+            node.pub_cmd.publish(Twist())
+        except Exception:
+            pass
         node.destroy_node()
         if rclpy.ok():          # 信号处理器可能已 shutdown 过，避免二次 shutdown 抛 RCLError
             rclpy.shutdown()

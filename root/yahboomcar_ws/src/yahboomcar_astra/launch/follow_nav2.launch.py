@@ -58,6 +58,11 @@ def generate_launch_description():
     close_stop_frac = LaunchConfiguration("close_stop_frac")
     close_stop_px = LaunchConfiguration("close_stop_px")
     size_smooth = LaunchConfiguration("size_smooth")
+    enable_close_rotate = LaunchConfiguration("enable_close_rotate")
+    rotate_kp = LaunchConfiguration("rotate_kp")
+    rotate_max = LaunchConfiguration("rotate_max")
+    rotate_deadband_deg = LaunchConfiguration("rotate_deadband_deg")
+    lost_rotate_time = LaunchConfiguration("lost_rotate_time")
     servo_sign = LaunchConfiguration("servo_sign")
 
     args = [
@@ -95,6 +100,16 @@ def generate_launch_description():
                               description="检测框最长边EMA≥此(px)=人明显很近→硬停(不依赖雷达，治近距侧向追幽灵前冲)；看日志ema标定，0=禁用"),
         DeclareLaunchArgument("size_smooth", default_value="0.6",
                               description="框尺寸EMA平滑(0~1)；SSD尺寸噪声大，硬停判据抖就调大"),
+        DeclareLaunchArgument("enable_close_rotate", default_value="true",
+                              description="近距(standoff内)不位移、只原地转底盘把人转回正前方(防人绕到侧后方时云台撞限位)；false=只停不转"),
+        DeclareLaunchArgument("rotate_kp", default_value="1.2",
+                              description="原地转向增益(方位rad→角速度rad/s)；转反了取负值，转太猛调小"),
+        DeclareLaunchArgument("rotate_max", default_value="0.6",
+                              description="原地转向角速度上限(rad/s)"),
+        DeclareLaunchArgument("rotate_deadband_deg", default_value="8.0",
+                              description="人在正前方±此角内就不转(防原地抽搐)；嫌对得不准调小、嫌来回蹭调大"),
+        DeclareLaunchArgument("lost_rotate_time", default_value="2.5",
+                              description="跟丢后朝最后看到的位置继续转多久(s)，常能把人重新转进视野；转到正对仍没看到会提前停。0=丢了立刻停"),
         DeclareLaunchArgument("servo_sign", default_value="-1.0",
                               description="云台pan硬件极性(本车实测-1.0)；正负反了会让云台跑到一侧不回来"),
         DeclareLaunchArgument("bringup", default_value="true",
@@ -195,6 +210,11 @@ def generate_launch_description():
             "close_stop_frac": ParameterValue(close_stop_frac, value_type=float),
             "close_stop_px": ParameterValue(close_stop_px, value_type=float),
             "size_smooth": ParameterValue(size_smooth, value_type=float),
+            "enable_close_rotate": ParameterValue(enable_close_rotate, value_type=bool),
+            "rotate_kp": ParameterValue(rotate_kp, value_type=float),
+            "rotate_max": ParameterValue(rotate_max, value_type=float),
+            "rotate_deadband_deg": ParameterValue(rotate_deadband_deg, value_type=float),
+            "lost_rotate_time": ParameterValue(lost_rotate_time, value_type=float),
             "servo_sign": ParameterValue(servo_sign, value_type=float),
         }],
     )
