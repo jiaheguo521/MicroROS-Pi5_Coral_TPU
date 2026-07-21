@@ -3,3 +3,10 @@ __pycache__/
 *.sw[nop]
 .vscode/
 deploy/dist/
+
+# Model binaries are never committed — fetch them after cloning:
+#   reid*/  — Edge TPU co-compile artifacts hosted on HuggingFace:
+#             run ./deploy/fetch_models.sh (downloads all by default).
+#   others  — stock Coral models (SSD face/COCO detector, coco_labels.txt):
+#             deploy/pack_and_push.sh downloads and caches them automatically.
+root/yahboomcar_ws/src/yahboomcar_astra/yahboomcar_astra/models/

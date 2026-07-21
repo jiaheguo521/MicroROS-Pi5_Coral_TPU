@@ -59,7 +59,9 @@ dl() {  # dl <url> <dest>；已存在则跳过
 }
 
 if [ "$DO_PACK" = 1 ]; then
-  mkdir -p "$CACHE" "$BUNDLE/models" "$BUNDLE/models/reid" "$BUNDLE/models/reid_youtu"
+  mkdir -p "$CACHE" "$BUNDLE/models" "$BUNDLE/models/reid" "$BUNDLE/models/reid_youtu" \
+           "$BUNDLE/models/reid_osnet05" "$BUNDLE/models/reid_osnet075" "$BUNDLE/models/reid_mnv2" \
+           "$BUNDLE/models/reid_youtu_p70"
 
   echo "[1/3] 下载依赖(带缓存) → $CACHE"
   dl "$TFLITE_WHL_URL"  "$CACHE/$TFLITE_WHL"
@@ -96,16 +98,18 @@ if [ "$DO_PACK" = 1 ]; then
   else
     dl "$COCO_LABELS_URL" "$CACHE/$COCO_LABELS"; cp "$CACHE/$COCO_LABELS" "$BUNDLE/models/"
   fi
-  # Re-ID co-compile 产物：本地 edgetpu_compiler 编出来的，官方没有发布，没有 URL 可下；
-  # 只能仓库自带，缺失就报错提示先跑 benchmarks/smoke_obj_reid_tpu.py 头部说明的 co-compile 步骤
-  # reid/ = 旧嵌入器(MobileNetV1，备选) reid_youtu/ = 新嵌入器(Youtu ReID，默认)，两对不能混用
-  for reid_dir in reid reid_youtu; do
+  # Re-ID co-compile 产物：edgetpu_compiler 编出来的，官方没有发布地址，体积大(~85MB)不入 git，
+  # 托管在 HuggingFace，缺失就提示跑 ./deploy/fetch_models.sh 取回。
+  # reid_youtu/=默认(未剪 base,最准) reid_youtu_p70/=剪70%(~18Hz,帧率优先) reid/=MobileNetV1(弱)
+  # reid_osnet05|osnet075|mnv2/=单源 Market(贴地不可用,仅平视备选)，每对独立 co-compile 不能混用
+  for reid_dir in reid reid_youtu reid_osnet05 reid_osnet075 reid_mnv2 reid_youtu_p70; do
     for f in "$REID_DET" "$REID_EMB"; do
       if [ -f "$ASTRA/yahboomcar_astra/models/$reid_dir/$f" ]; then
         cp "$ASTRA/yahboomcar_astra/models/$reid_dir/$f" "$BUNDLE/models/$reid_dir/"
       else
-        echo "缺少 $reid_dir/$f，请先在开发机跑 edgetpu_compiler co-compile 生成（见 docs/pathB_follow_devlog.md Re-ID 章节），" \
-             "产物放到 $ASTRA/yahboomcar_astra/models/$reid_dir/ 后再重跑本脚本"
+        echo "缺少模型 $reid_dir/$f" >&2
+        echo "  → 先跑：./deploy/fetch_models.sh        （默认全下，已有的会跳过）" >&2
+        echo "  → 或只下这一个：./deploy/fetch_models.sh $reid_dir" >&2
         exit 1
       fi
     done

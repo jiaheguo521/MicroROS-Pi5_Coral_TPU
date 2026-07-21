@@ -37,12 +37,27 @@
 │   ├── ros2_humble.sh             # 容器启动脚本（参考）
 │   └── start_agent_rpi5.sh        # micro-ROS agent 启动（参考）
 ├── docker/Dockerfile.tpu          # 子镜像构建配方 → :4.1.2-tpu
+├── deploy/fetch_models.sh         # 一键：从 HuggingFace 下载 Re-ID 模型（默认全下）
 └── deploy/pack_and_push.sh        # 一键：下载依赖 → 组装 → scp 到车
 ```
 
 ## 快速开始
 
 TPU 依赖以**子镜像** `:4.1.2-tpu` 的形式叠在原厂 `:4.1.2` 上，原镜像不动。
+
+**0. 克隆后先取模型**（[deploy/fetch_models.sh](deploy/fetch_models.sh)）：Re-ID 模型是 `edgetpu_compiler`
+的 co-compile 产物、无官方下载地址且体积较大（~85MB），不入 git，托管在
+[HuggingFace](https://huggingface.co/jiaheguo521/microros-pi5-coral-tpu-models)：
+
+```bash
+./deploy/fetch_models.sh              # 默认全下（已存在且校验通过会跳过，可重复运行）
+./deploy/fetch_models.sh --list       # 看有哪些模型、各自的速度/精度权衡
+./deploy/fetch_models.sh reid_youtu   # 只下某一个
+```
+
+> ⚠️ `det` 和 `emb` 必须来自**同一个目录**——每对是一次 co-compile 的产物，两个网络共享同一块
+> 8MB 片上 SRAM、缓存划分在编译期定死，跨目录混用会导致延迟劣化和行为异常。
+> （SSD 人脸/COCO 检测器有 Coral 官方地址，`pack_and_push.sh` 会自动下载并缓存。）
 
 **1. 开发机——下载依赖、组装构建包、推送到车**（[deploy/pack_and_push.sh](deploy/pack_and_push.sh)）：
 
@@ -92,11 +107,32 @@ ros2 run yahboomcar_astra objTracker_tpu
 ros2 launch yahboomcar_astra follow_nav2.launch.py                 # 默认 controller:=dwb；controller:=rpp 可 A/B 对比
 
 # Nav2 跟随 + Re-ID 身份锁定（第二个 TPU 网络，拒误检/多人不跳/遮挡重认）
-# enable_gimbal_pan:=false：锁定前云台会一直慢扫搜索，跟"站稳3秒才锁定"手势冲突，故关闭
-ros2 launch yahboomcar_astra follow_nav2.launch.py detector:=objTracker_reid_tpu enable_gimbal_pan:=false
+# 云台主动跟人构图 + 跟丢后高阈值重锁，均已默认开启
+ros2 launch yahboomcar_astra follow_nav2.launch.py detector:=objTracker_reid_tpu
 ```
 
 检测器参数：`target_label`（默认 `person`）、`conf_threshold`（默认 `0.5`）、`min_hits`（去抖，默认 `3`）。控制器 `objControl` 的跟随/搜索参数（`target_dist`、`front_angle`、`angular_kp` …）可运行时调，见节点 `declare_param`。
+
+### 现场调参指南（都是 launch 参数，改完即生效、无需重建镜像）
+
+**下列默认值只是本车实测的起点**，和相机高度、场地、穿着强相关，建议现场调。
+
+**1) Re-ID 身份阈值（最重要，换 `reid_model` 必须重标）**——先开 `debug_sim:=true` 看每帧各候选的实际相似度（`*`=被选中），让**目标本人**和**旁人**分别走动，记下两组范围再定：
+
+| 参数 | 默认 | 怎么定 |
+|---|---|---|
+| `sim_floor` | `0.6` | 维持已锁目标的门槛。**必须高于"旁人的最高分"**，否则目标一走开、旁人勉强过线就被当成目标接上（且系统会一直停在"正在跟"状态，下面那道重捕闸永远不触发）；但要低于目标侧身/走远时的分数，否则老丢自己。 |
+| `relock_sim_floor` | `0.75` | **跟丢后重捕**的高门槛，要比 `sim_floor` 明显高（建议 +0.1 以上）。 |
+| `relock_min_hits` | `5` | 重捕还需连续这么多帧都过高门槛才认。 |
+| `ema_min_sim` | `0.65` | 只有分数≥此值才把外观写回模板，防边界误匹配带偏模板。 |
+
+> 本车实测（未剪枝 Youtu）：目标 0.87~0.98、旁人 0.09~0.65 → `sim_floor` 取 0.65~0.70、`relock_sim_floor` 取 0.75~0.80 较稳妥。**换模型后全部作废，必须重标。**
+
+**2) 云台构图**：`tilt_head_frac`(0.3，头老出画就调大)、`tilt_kp`/`tilt_smooth`(0.05/0.6，上下抖就减 kp 增 smooth)、`tilt_sign`/`servo_sign`(舵机极性，转反了取反号)、`pan_max_step_deg`(6.0，横走跟不上调大)、`enable_gimbal_tilt`/`enable_gimbal_pan`(可单独关一路来定位问题)。
+
+**3) 跟随距离/近距停车**：`standoff`(1.5m)；`close_stop_px`(320)——检测框(EMA)超过此值就锁死不前进，**近距时相机方位和雷达距离都会失效，只有"框够大"可靠**；贴太近就调小、太早停就调大，按日志 `follow: dist=.. size=.. ema=..` 走到想停的距离取当时的 `ema` 值。`enable_lost_search`(false，跟丢后云台默认不动、保持最后指向；要开可配 `search_step_deg`)。
+
+**4) 帧率 vs 精度**：`reid_model:=reid_youtu`(默认最准 ~4.4Hz)｜`reid_youtu_p70`(~18Hz，云台明显跟手，身份区分略弱)。**云台延迟主要由检测帧率决定、不是 CPU**；换模型记得重标阈值。
 
 把自启脚本 `ros2_humble.sh` 指向 `:4.1.2-tpu` 并加 `-v /dev/bus/usb:/dev/bus/usb`，让容器能访问 Edge TPU 的 USB 设备。
 

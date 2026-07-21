@@ -37,12 +37,30 @@ The stock car follows a clean **`perception → message → controller`** split.
 │   ├── ros2_humble.sh             # container launch script (reference)
 │   └── start_agent_rpi5.sh        # micro-ROS agent launch (reference)
 ├── docker/Dockerfile.tpu          # child-image recipe → :4.1.2-tpu
+├── deploy/fetch_models.sh         # one-click: download Re-ID models from HuggingFace (all by default)
 └── deploy/pack_and_push.sh        # one-click: download deps → bundle → scp to car
 ```
 
 ## Quick start
 
 The Edge TPU deps are added as a **child image** `:4.1.2-tpu` layered on the stock `:4.1.2` — the original image is untouched.
+
+**0. After cloning, fetch the models** ([deploy/fetch_models.sh](deploy/fetch_models.sh)): the Re-ID
+models are `edgetpu_compiler` co-compilation artifacts with no official download URL, and they're
+large (~85 MB), so they aren't committed to git. They live on
+[HuggingFace](https://huggingface.co/jiaheguo521/microros-pi5-coral-tpu-models):
+
+```bash
+./deploy/fetch_models.sh              # downloads all (skips present + verified files; safe to re-run)
+./deploy/fetch_models.sh --list       # list variants with their speed/accuracy trade-offs
+./deploy/fetch_models.sh reid_youtu   # or fetch just one
+```
+
+> ⚠️ `det` and `emb` must come from **the same directory** — each pair is one co-compilation in
+> which both networks share the same 8 MB of on-chip SRAM, with the cache split fixed at compile
+> time. Mixing files across directories degrades latency and behaviour.
+> (The stock SSD face/COCO detectors have official Coral URLs and are fetched+cached automatically
+> by `pack_and_push.sh`.)
 
 **1. On the dev machine — download deps, assemble the build bundle, push to the car** ([deploy/pack_and_push.sh](deploy/pack_and_push.sh)):
 
@@ -92,11 +110,32 @@ ros2 run yahboomcar_astra objTracker_tpu
 ros2 launch yahboomcar_astra follow_nav2.launch.py                 # default controller:=dwb; controller:=rpp to A/B
 
 # Nav2 follow + Re-ID identity lock (second TPU net: reject false boxes / multi-person / re-acquire after occlusion)
-# enable_gimbal_pan:=false: before lock, the gimbal sweeps to search, which fights the "stand still 3s to lock" gesture
-ros2 launch yahboomcar_astra follow_nav2.launch.py detector:=objTracker_reid_tpu enable_gimbal_pan:=false
+# Active gimbal framing + high-threshold re-lock after loss are both on by default
+ros2 launch yahboomcar_astra follow_nav2.launch.py detector:=objTracker_reid_tpu
 ```
 
 Detector params: `target_label` (default `person`), `conf_threshold` (default `0.5`), `min_hits` (debounce, default `3`). Controller `objControl` follow/search params (`target_dist`, `front_angle`, `angular_kp`, …) are tunable at runtime — see the node's `declare_param`.
+
+### Field tuning guide (all launch args — effective immediately, no image rebuild)
+
+**The defaults below are just this car's measured starting point** — they depend strongly on camera height, venue and clothing, so expect to tune on site.
+
+**1) Re-ID identity thresholds (most important; MUST be re-calibrated when changing `reid_model`)** — run with `debug_sim:=true` to print per-frame similarity for each candidate (`*` = picked). Have the **target** and a **bystander** each move around, note the two ranges, then set:
+
+| Param | Default | How to set it |
+|---|---|---|
+| `sim_floor` | `0.6` | Threshold to *maintain* a locked target. **Must be above the bystander's peak score** — otherwise once the target steps away, a bystander squeaking past it is accepted as the target (and the tracker stays in "following" state, so the re-lock gate below never fires). Keep it below the target's score when turning/far, or you'll keep losing yourself. |
+| `relock_sim_floor` | `0.75` | High bar to **re-acquire after a loss**; clearly above `sim_floor` (≥ +0.1). |
+| `relock_min_hits` | `5` | Re-acquire also needs this many *consecutive* frames above the high bar. |
+| `ema_min_sim` | `0.65` | Only write appearance back to the template at/above this score, so borderline matches can't drift it. |
+
+> Measured here (unpruned Youtu): target 0.87–0.98, bystander 0.09–0.65 → `sim_floor` 0.65–0.70 and `relock_sim_floor` 0.75–0.80 are sensible. **Changing the model invalidates all of these.**
+
+**2) Gimbal framing**: `tilt_head_frac` (0.3 — raise if heads leave the top of frame), `tilt_kp`/`tilt_smooth` (0.05/0.6 — if it bobs, lower kp and raise smooth), `tilt_sign`/`servo_sign` (servo polarity — flip if it drives the wrong way), `pan_max_step_deg` (6.0 — raise if it can't keep up with sideways walking), `enable_gimbal_tilt`/`enable_gimbal_pan` (disable one axis to isolate a problem).
+
+**3) Follow distance / close-range stop**: `standoff` (1.5 m); `close_stop_px` (320) — once the smoothed box size exceeds this, forward motion is locked out, because **at close range both camera bearing and LiDAR range degrade and "the box is big" is the only reliable cue**; lower it if the robot creeps too close, raise it if it stops too early — calibrate from the `follow: dist=.. size=.. ema=..` log by walking to your desired stop distance and reading `ema`. `enable_lost_search` (false — after a loss the gimbal holds its last aim rather than sweeping; enable it with `search_step_deg` to sweep).
+
+**4) Frame rate vs accuracy**: `reid_model:=reid_youtu` (default, most accurate, ~4.4 Hz) | `reid_youtu_p70` (~18 Hz, noticeably snappier gimbal, slightly weaker identity separation). **Gimbal latency is dominated by detector frame rate, not CPU**; re-calibrate thresholds after switching.
 
 Point the autostart `ros2_humble.sh` at `:4.1.2-tpu` and add `-v /dev/bus/usb:/dev/bus/usb` to give the container USB access to the Edge TPU.
 

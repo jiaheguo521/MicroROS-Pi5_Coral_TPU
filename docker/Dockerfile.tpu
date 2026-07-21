@@ -26,10 +26,20 @@ COPY models/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite \
      ${PKG}/yahboomcar_astra/models/ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite
 COPY models/coco_labels.txt ${PKG}/yahboomcar_astra/models/coco_labels.txt
 # Re-ID：检测器+嵌入器 co-compile 产物（独立子目录+改名，不与上面的单独检测器模型混用/共享缓存）
-# reid/ = 旧嵌入器(MobileNetV1，小/快/区分度弱，备选) reid_youtu/ = 新嵌入器(Youtu ReID ResNet50，默认)
+# reid/=旧(MobileNetV1,备选) reid_youtu/=Youtu ReID(ResNet50,51ms慢)
+# reid_osnet05/ reid_osnet075/ reid_mnv2/ = 轻量 Market-1501 Re-ID(osnet_x0_5/x0_75/mobilenetv2)，同 SSD 重新 co-compile
 COPY models/reid/det_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid/det_reid_edgetpu.tflite
 COPY models/reid/emb_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid/emb_reid_edgetpu.tflite
 COPY models/reid_youtu/det_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_youtu/det_reid_edgetpu.tflite
 COPY models/reid_youtu/emb_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_youtu/emb_reid_edgetpu.tflite
+COPY models/reid_osnet05/det_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_osnet05/det_reid_edgetpu.tflite
+COPY models/reid_osnet05/emb_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_osnet05/emb_reid_edgetpu.tflite
+COPY models/reid_osnet075/det_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_osnet075/det_reid_edgetpu.tflite
+COPY models/reid_osnet075/emb_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_osnet075/emb_reid_edgetpu.tflite
+COPY models/reid_mnv2/det_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_mnv2/det_reid_edgetpu.tflite
+COPY models/reid_mnv2/emb_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_mnv2/emb_reid_edgetpu.tflite
+# reid_youtu_p70/ = Youtu lite(多源 ResNet50) 剪枝70%，贴地视角实测唯一可用系的帧率优先档（默认）
+COPY models/reid_youtu_p70/det_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_youtu_p70/det_reid_edgetpu.tflite
+COPY models/reid_youtu_p70/emb_reid_edgetpu.tflite ${PKG}/yahboomcar_astra/models/reid_youtu_p70/emb_reid_edgetpu.tflite
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && cd /root/yahboomcar_ws && \
     colcon build --packages-select yahboomcar_astra"

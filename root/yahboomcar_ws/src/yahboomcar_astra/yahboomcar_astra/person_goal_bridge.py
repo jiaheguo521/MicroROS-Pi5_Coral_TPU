@@ -5,8 +5,9 @@
     测量在 odom 空间做离群门控——椅子挡在中间→该方向雷达返回骤近→测点跳→判遮挡→
     **保持估计不动**，Nav2 继续朝估计走并绕开椅子，而不是把椅子当成人而停车。
   * **抗漂移**：估计做平滑，且相机持续重测→里程计漂移不累积进目标。
-  * **解耦云台**：云台不再积分 cx（那会与底盘转向环耦合震荡）。跟随时云台回正(0)、
-    由底盘转向对准人；**只有丢失目标才慢扫搜索**。两环都读同一 odom 估计、互不反馈。
+  * **解耦云台**：pan 不积分 cx（那会与底盘转向环耦合震荡），改指向 odom 估计的人方位、
+    由底盘转向对准；tilt 跟 cy 竖直居中（纯像素伺服、与底盘无耦合）。**只在"曾锁定过又丢失"
+    才慢扫搜索，冷启动/未锁不扫**（避免扫描取景与 Re-ID 站稳锁定打架，见 devlog §8.5）。
 
 链路：/Current_point(cx) →(云台角+残余cx)方位 → /scan 扇区最近距离 → 人在激光帧
       → TF 转 odom → EMA+门控进 est_odom → 沿 robot→est 方向后退 standoff 得 odom 目标
@@ -68,7 +69,7 @@ class PersonGoalBridge(Node):
         self.declare_parameter("hfov_deg", 60.0)         # ⏳ 车上实测
         self.declare_parameter("bearing_sign", 1.0)       # ⏳ 转错取反
         self.declare_parameter("sector_half_deg", 8.0)    # 雷达扇区半宽
-        self.declare_parameter("standoff", 1.0)           # 停在人前多远 (m)
+        self.declare_parameter("standoff", 1.5)           # 停在人前多远 (m)
         self.declare_parameter("goal_frame", "odom")      # Nav2 全局帧
         self.declare_parameter("base_frame", "base_link") # 机器人本体帧(取 odom 位姿)
         self.declare_parameter("resend_dist", 0.25)       # goal 移动超此距离才重发 (m)
@@ -80,12 +81,36 @@ class PersonGoalBridge(Node):
         self.declare_parameter("max_pos_jump", 0.8)       # 测点在 odom 里单帧跳超此(m)→判遮挡/离群→保持估计
         self.declare_parameter("max_rejects", 5)          # 连续拒这么多次就认账(人真的移位了)
         self.declare_parameter("stop_deadband", 0.15)     # 到 standoff+此(m)内→取消目标停车(滞回)
+        # 近距滞回硬停：dist<standoff×close_stop_frac 进 hold_stop(最高优先级不发目标)，
+        # 连续 resume_frames 帧确认退到 standoff+deadband 外才解除(防近距误采偏远→前冲)
+        self.declare_parameter("close_stop_frac", 0.9)    # 进硬停的近距系数(×standoff)
+        self.declare_parameter("resume_frames", 3)        # 解除硬停需连续这么多帧确认人退远(tick 5Hz)
+        # 不依赖雷达的近距判据：人越近检测框越大。近距+侧向时云台指向侧方、雷达扇区易采到背景→
+        # 距离读偏远→追幽灵前冲；此时框尺寸(px)才是可靠的"近"信号。框≥此值直接硬停，无视雷达距离。
+        self.declare_parameter("close_stop_px", 320.0)    # 检测框最长边(EMA,px)≥此=人明显很近→硬停；0=禁用只靠雷达距离
+        self.declare_parameter("size_smooth", 0.6)        # 框尺寸 EMA(0~1,越大越平滑)：SSD 尺寸噪声大，先平滑再判硬停
         self.declare_parameter("gimbal_tilt", -30)        # servo_s2 俯仰(负=低头)
         # 云台 v3：跟随时回正(0)由底盘转向对准；丢失才慢扫搜索。不积分 cx→不与底盘耦合。
         self.declare_parameter("enable_gimbal_pan", True)
         self.declare_parameter("pan_limit_deg", 70.0)     # 云台 pan 机械上限 (±deg)
-        self.declare_parameter("pan_max_step_deg", 4.0)   # 每个云台拍最多转多少(跟踪/搜索速度，限速抑抖)
+        self.declare_parameter("pan_max_step_deg", 6.0)   # 每个云台拍最多转多少(跟踪/搜索速度)；横走跟不上→调大
         self.declare_parameter("pan_deadband_deg", 3.0)   # 人在云台视线±此角内就不动(非必要不动)
+        # 丢失后是否扫描搜索。默认 False=**保持最后指向不动**(人多半原地附近重现，停着更快重认、不甩镜头)。
+        # 扫描速度独立于跟踪速度：pan_max_step 为跟手调大后若复用会让搜索甩飞(实测 60°/s 太快)。
+        self.declare_parameter("enable_lost_search", False)
+        self.declare_parameter("search_step_deg", 2.0)    # 搜索扫描每拍转多少(deg，10Hz→20°/s)
+        # 主动 tilt(俯仰)跟踪：把人竖直居中(缓解贴地仰视时人走远/走近头顶出画)。tilt 与底盘无耦合
+        # (底盘无 pitch)，是纯像素伺服的干净单环，不会重演 pan 的震荡。极性 tilt_sign 上车验，同 servo_sign。
+        self.declare_parameter("enable_gimbal_tilt", True)
+        self.declare_parameter("tilt_setpoint_px", 240.0)  # 想把人的头部估计点竖直放在画面哪个 y(px；640x480 中心=240)
+        # 跟"头部估计点"而非框中心：贴地近距人框占满/顶部被切→框中心恒在画面中部、头出画也不动(饱和)。
+        # 用检测器已发的框尺寸把跟踪点上移 head_y=cy−frac×size(≈框顶)，框越大上移越多→越使劲上抬。0=退回框中心。
+        self.declare_parameter("tilt_head_frac", 0.3)
+        self.declare_parameter("tilt_smooth", 0.6)         # head_y 目标 EMA(0~1，越大越平滑)：滤检测框逐帧抖动、防云台上下颤
+        self.declare_parameter("tilt_deadband_px", 25.0)   # 头部点在此竖直像素带内就不动(抑颤)
+        self.declare_parameter("tilt_kp", 0.05)            # 竖直像素误差→俯仰角步进增益 (deg/px)
+        self.declare_parameter("tilt_max_step_deg", 3.0)   # 每个云台拍俯仰最多转多少(限速抑抖)
+        self.declare_parameter("tilt_sign", 1.0)           # 硬件极性(上车验，转反取 -1.0)
         self.declare_parameter("gimbal_period", 0.1)      # 云台控制周期 (s)
         # 硬件极性：本车实测需 -1.0（正号会让"指向估计"环变正反馈→云台跑到一侧不回来）。
         self.declare_parameter("servo_sign", -1.0)
@@ -105,11 +130,25 @@ class PersonGoalBridge(Node):
         self.max_pos_jump = g("max_pos_jump").value
         self.max_rejects = g("max_rejects").value
         self.stop_deadband = g("stop_deadband").value
+        self.close_stop_frac = g("close_stop_frac").value
+        self.resume_frames = g("resume_frames").value
+        self.close_stop_px = g("close_stop_px").value
+        self.size_smooth = g("size_smooth").value
         self.gimbal_tilt = int(g("gimbal_tilt").value)
         self.enable_gimbal_pan = g("enable_gimbal_pan").value
         self.pan_limit = math.radians(g("pan_limit_deg").value)
         self.pan_max_step = math.radians(g("pan_max_step_deg").value)
         self.pan_deadband = math.radians(g("pan_deadband_deg").value)
+        self.enable_lost_search = g("enable_lost_search").value
+        self.search_step = math.radians(g("search_step_deg").value)
+        self.enable_gimbal_tilt = g("enable_gimbal_tilt").value
+        self.tilt_setpoint_px = g("tilt_setpoint_px").value
+        self.tilt_head_frac = g("tilt_head_frac").value
+        self.tilt_smooth = g("tilt_smooth").value
+        self.tilt_deadband_px = g("tilt_deadband_px").value
+        self.tilt_kp = g("tilt_kp").value
+        self.tilt_max_step = g("tilt_max_step_deg").value  # deg（servo_s2 本身就是度，不转 rad）
+        self.tilt_sign = g("tilt_sign").value
         self.gimbal_period = g("gimbal_period").value
         self.servo_sign = g("servo_sign").value
 
@@ -127,6 +166,12 @@ class PersonGoalBridge(Node):
 
         # --- 状态 ---
         self.cx = None
+        self.cy = None
+        self.person_size = None     # 检测框最长边(px)，供 tilt 估计头部点：head_y=cy−frac×size
+        self.size_ema = None        # 框尺寸 EMA(平滑噪声)，供近距硬停判据 close_by_box
+        self.new_pos = False        # 有新检测帧未消费：tilt 只在此为真时步进(防低检测率下过度积分→摆动)
+        self.head_y_ema = None      # tilt 目标 head_y 的 EMA(滤检测框逐帧抖动)
+        self.ever_locked = False    # Re-ID 是否曾经锁定过(收到过 /Current_point)：区分冷启动 vs 丢失
         self.last_pos_time = 0.0
         self.scan = None
         self.last_scan_time = 0.0
@@ -135,52 +180,94 @@ class PersonGoalBridge(Node):
         self.last_goal_xy = None
         self.last_sent_time = 0.0
         self.cam_yaw = 0.0          # 云台 pan 角(rad, base 系 +左)：跟随时→0，丢失时扫
+        self.cam_tilt = float(self.gimbal_tilt)  # 云台 tilt 角(deg, servo_s2)：跟 cy 竖直居中
         self.search_dir = 1.0
         self.active_goal_handle = None
         self.stopped = False        # 是否已取消目标停车（避免重复取消）
+        self.hold_stop = False      # 近距滞回硬停：为真时最高优先级不发目标
+        self.far_count = 0          # 连续确认"人已退远"的帧数，达 resume_frames 才解除 hold_stop
 
-        # 云台俯仰固定(低头)；pan 初始回中
+        # 云台俯仰置初始位(gimbal_tilt)、pan 初始回中；之后 _gimbal_tick 主动跟踪
         s2 = Int32(); s2.data = self.gimbal_tilt; self.pub_s2.publish(s2)
         s1 = Int32(); s1.data = 0; self.pub_s1.publish(s1)
 
         self.timer = self.create_timer(0.2, self.tick)                     # 5Hz 估计+决策
         self.gtimer = self.create_timer(self.gimbal_period, self._gimbal_tick)  # 10Hz 云台
         self.get_logger().info(
-            "person_goal_bridge v3 up: hfov=%.1f sign=%.0f standoff=%.2f pan=%s tilt=%d"
-            % (self.hfov_deg, self.bearing_sign, self.standoff, self.enable_gimbal_pan, self.gimbal_tilt))
+            "person_goal_bridge v3 up: hfov=%.1f sign=%.0f standoff=%.2f pan=%s tilt_track=%s(rest=%d)"
+            % (self.hfov_deg, self.bearing_sign, self.standoff,
+               self.enable_gimbal_pan, self.enable_gimbal_tilt, self.gimbal_tilt))
 
     def on_position(self, msg):
         self.cx = msg.anglex
+        self.cy = msg.angley
+        self.person_size = msg.distance   # 框最长边(px)，tilt 用它把跟踪点从框中心上移到头部
+        # SSD 框尺寸逐帧噪声极大(同位置 ±120px)，做近距硬停判据前先 EMA 平滑，否则 [box-close]
+        # 会一帧触发一帧不触发→hold 在边界反复→趁掉值那几帧被 resume 解锁→前冲
+        self.size_ema = msg.distance if self.size_ema is None else \
+            self.size_smooth * self.size_ema + (1 - self.size_smooth) * msg.distance
+        self.new_pos = True       # 标记新检测帧，供 tilt 门控步进（防低检测率下过度积分→摆动）
+        self.ever_locked = True   # 收到过检测点=Re-ID 已确认锁定过；之后没点才算"丢失"(而非冷启动)
         self.last_pos_time = time.time()
 
     def on_scan(self, msg):
         self.scan = msg
         self.last_scan_time = time.time()
 
-    # ---- 云台 v3：指向 odom 估计(与底盘解耦、不震荡)、丢失才慢扫；把人锁在视野内直到底盘转过来 ----
+    # ---- 云台 v3：pan 指向 odom 估计(与底盘解耦、不震荡)、tilt 跟 cy 竖直居中；
+    #      丢失才慢扫，冷启动/未锁不扫(避 §8.5 扫描 vs 站稳锁定冲突) ----
     def _gimbal_tick(self):
-        if not self.enable_gimbal_pan:
-            return
         now = time.time()
         detected = self.cx is not None and (now - self.last_pos_time) <= self.lost_timeout
-        if not detected:
-            # 丢失：在 ±pan_limit 间慢扫搜索
-            self.cam_yaw += self.search_dir * self.pan_max_step
-            if self.cam_yaw >= self.pan_limit:
-                self.cam_yaw = self.pan_limit; self.search_dir = -1.0
-            elif self.cam_yaw <= -self.pan_limit:
-                self.cam_yaw = -self.pan_limit; self.search_dir = 1.0
-        else:
-            # 有人：把云台指向"人相对车的方位"，把人锁在视野中央。
-            # 底盘转向对准人时该方位自然→0，云台随之回正——不积分 cx，不与底盘耦合。
-            desired = self._person_bearing_base()
-            if desired is not None:
-                err = math.atan2(math.sin(desired - self.cam_yaw), math.cos(desired - self.cam_yaw))
-                if abs(err) > self.pan_deadband:   # 人已在视线中央就不动（非必要不动）
-                    self.cam_yaw += max(-self.pan_max_step, min(self.pan_max_step, err))
-                    self.cam_yaw = max(-self.pan_limit, min(self.pan_limit, self.cam_yaw))
-        s1 = Int32(); s1.data = int(self.servo_sign * math.degrees(self.cam_yaw))
-        self.pub_s1.publish(s1)
+        # --- pan (servo_s1) ---
+        if self.enable_gimbal_pan:
+            if not detected:
+                # 冷启动/从未锁定：锁正前方不扫（扫描会改取景，与 Re-ID"站稳3秒"锁定打架，见 §8.5）。
+                # 曾锁定又丢失：默认 **enable_lost_search=False → 保持最后指向不动**——人多半在原地
+                # 附近重现，停着比扫更快重认、也不甩镜头。要扫则用**独立的 search_step**，
+                # 绝不复用 pan_max_step（那个为跟手调大后会让搜索甩到飞快）。
+                if self.ever_locked and self.enable_lost_search:
+                    self.cam_yaw += self.search_dir * self.search_step
+                    if self.cam_yaw >= self.pan_limit:
+                        self.cam_yaw = self.pan_limit; self.search_dir = -1.0
+                    elif self.cam_yaw <= -self.pan_limit:
+                        self.cam_yaw = -self.pan_limit; self.search_dir = 1.0
+            else:
+                # 有人：把云台指向"人相对车的方位"，把人锁在视野中央。
+                # 底盘转向对准人时该方位自然→0，云台随之回正——不积分 cx，不与底盘耦合。
+                desired = self._person_bearing_base()
+                if desired is not None:
+                    err = math.atan2(math.sin(desired - self.cam_yaw), math.cos(desired - self.cam_yaw))
+                    if abs(err) > self.pan_deadband:   # 人已在视线中央就不动（非必要不动）
+                        self.cam_yaw += max(-self.pan_max_step, min(self.pan_max_step, err))
+                        self.cam_yaw = max(-self.pan_limit, min(self.pan_limit, self.cam_yaw))
+            s1 = Int32(); s1.data = int(self.servo_sign * math.degrees(self.cam_yaw))
+            self.pub_s1.publish(s1)
+        # --- tilt (servo_s2) ---
+        if self.enable_gimbal_tilt:
+            if detected and self.cy is not None:
+                # 只在有"新检测帧"时才走一步：检测器~4.4Hz、云台 10Hz，若每拍都用同一(过期)cy 误差
+                # 步进，一次检测间隔会累加 2~3 步→冲过头→上下摆动(objControl 同注释)。pan 用 odom+TF
+                # 连续反馈不受此影响，只 tilt 需要门控。像素伺服：把"头部估计点"移到 tilt_setpoint_px
+                # (不是框中心，否则近距框占满/切顶时框中心恒在画面中部→头出画也不上抬，饱和)。
+                if self.new_pos:
+                    raw = self.cy - self.tilt_head_frac * self.person_size if self.person_size else self.cy
+                    # EMA 平滑目标：检测框(尤其尺寸/宽高比)逐帧抖→head_y 直接跟会上下颤，先滤噪再伺服
+                    self.head_y_ema = raw if self.head_y_ema is None else \
+                        self.tilt_smooth * self.head_y_ema + (1 - self.tilt_smooth) * raw
+                    err_px = self.tilt_setpoint_px - self.head_y_ema
+                    if abs(err_px) > self.tilt_deadband_px:
+                        step = self.tilt_sign * self.tilt_kp * err_px
+                        step = max(-self.tilt_max_step, min(self.tilt_max_step, step))
+                        self.cam_tilt = max(-90.0, min(20.0, self.cam_tilt + step))
+                    self.new_pos = False
+            else:
+                # 开了搜索才回默认俯仰位；否则保持最后俯仰不动（与 pan 一致：丢失后镜头不乱动）
+                if self.ever_locked and self.enable_lost_search:
+                    self.cam_tilt = float(self.gimbal_tilt)
+                self.head_y_ema = None                    # 清 EMA，重认时从头平滑
+            s2 = Int32(); s2.data = int(round(self.cam_tilt))
+            self.pub_s2.publish(s2)
 
     def _person_bearing_base(self):
         """人相对车(base 系)的方位角。优先用 odom 估计换算(解耦)；估计未建立时退回用 cx 直读
@@ -273,6 +360,7 @@ class PersonGoalBridge(Node):
                 or now - self.last_scan_time > self.lost_timeout):
             self._stop()
             self.est_odom = None
+            self.size_ema = None    # 丢失清 EMA，重认时从头平滑
             return
 
         z = self._measure_person_odom()
@@ -288,8 +376,31 @@ class PersonGoalBridge(Node):
         dy = self.est_odom[1] - rob[1]
         dist = math.hypot(dx, dy)
 
-        # 到 standoff：取消目标停车（滞回，别在人身边抽搐/原地拧）
-        if dist <= self.standoff + self.stop_deadband:
+        # 近距滞回硬停（最高优先级）。两个进停触发，任一满足就 hold_stop：
+        #  ① 雷达距离近：dist < standoff×close_stop_frac；
+        #  ② 检测框够大：person_size ≥ close_stop_px——**不依赖雷达**。近距+侧向时云台指向侧方、
+        #     雷达扇区易采到人身后背景→距离读偏远(dist 会假装很远)→追幽灵前冲，此时只有框尺寸可靠。
+        # 只有"雷达退远 且 框也变小"连续 resume_frames 帧才解除——单帧误采的"偏远"或抖动不足以解锁。
+        close_by_box = self.size_ema is not None and self.close_stop_px > 0 \
+            and self.size_ema >= self.close_stop_px
+        close_by_dist = dist < self.standoff * self.close_stop_frac
+        self.get_logger().info(
+            "follow: dist=%.2f size=%.0f ema=%.0f hold=%s%s" % (
+                dist, self.person_size if self.person_size else -1,
+                self.size_ema if self.size_ema else -1, self.hold_stop,
+                " [box-close]" if close_by_box else ""),
+            throttle_duration_sec=1.0)
+        if close_by_dist or close_by_box:
+            self.hold_stop = True
+            self.far_count = 0
+        elif dist > self.standoff + self.stop_deadband:   # 雷达退远且未 close_by_box 才累计
+            self.far_count += 1
+            if self.far_count >= self.resume_frames:
+                self.hold_stop = False
+        else:
+            self.far_count = 0
+        # hold_stop 或到 standoff 死区内：取消目标停车（别在人身边抽搐/原地拧）
+        if self.hold_stop or dist <= self.standoff + self.stop_deadband:
             self._stop()
             return
 
